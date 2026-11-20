@@ -133,6 +133,19 @@ export class PolkadotFlopChain implements FlopChain {
       );
   }
   async snapshot(escrowId?: string, at?: string): Promise<FlopSnapshot> {
+    try {
+      return await this.snapshotInner(escrowId, at);
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("flop:")) throw error;
+      throw new Error("flop: failed to read finalized chain state", {
+        cause: error,
+      });
+    }
+  }
+  private async snapshotInner(
+    escrowId?: string,
+    at?: string,
+  ): Promise<FlopSnapshot> {
     const hash = at ?? (await this.api.rpc.chain.getFinalizedHead()).toHex();
     const [view, header, genesis] = await Promise.all([
       this.api.at(hash),
@@ -171,6 +184,16 @@ export class PolkadotFlopChain implements FlopChain {
           ? number
           : integer(prefixJson[0], "runtime finalized height"),
     };
+    // Validate what we return, not just what we read: a finalized height above
+    // the snapshot's own height, a non-positive timestamp, or a non-hash
+    // genesis/hash is malformed state, same rule FlopRail.checkSnapshot applies.
+    if (
+      !HEX32.test(snapshot.genesis) ||
+      !HEX32.test(snapshot.hash) ||
+      snapshot.finalizedNumber > snapshot.number ||
+      snapshot.timestampMs <= 0
+    )
+      throw new Error("flop: malformed finalized snapshot");
     if (escrowId !== undefined) {
       const codec = (await view.query.hasStation.escrows(
         escrowId,
@@ -178,13 +201,26 @@ export class PolkadotFlopChain implements FlopChain {
       if (codec.isSome) {
         const record = codec.unwrap();
         const raw = record.toJSON() as Record<string, unknown>;
+        if (!raw || typeof raw !== "object" || Array.isArray(raw))
+          throw new Error("flop: malformed escrow record");
         // Re-encode accounts through metadata: JSON may use SS58, while DID mapping is AccountId32.
-        const account = (value: unknown) =>
-          this.api.registry.createType("AccountId32", value).toHex();
+        const account = (value: unknown) => {
+          try {
+            return this.api.registry.createType("AccountId32", value).toHex();
+          } catch {
+            throw new Error("flop: malformed escrow account");
+          }
+        };
         const p = raw.policy as {
           combinator: unknown;
           clauses: Record<string, unknown>[];
-        };
+        } | null | undefined;
+        if (!p || typeof p !== "object" || !Array.isArray(p.clauses))
+          throw new Error("flop: malformed escrow record");
+        for (const clause of p.clauses) {
+          if (!clause || typeof clause !== "object" || Array.isArray(clause))
+            throw new Error("flop: malformed escrow record");
+        }
         // Combinator has a data-bearing Threshold variant: SCALE JSON encodes And
         // as {and:null}, not the plain string used by the fieldless status enum.
         const combinator =
@@ -207,16 +243,31 @@ export class PolkadotFlopChain implements FlopChain {
             return clause; // Any extra/unknown policy leaf fails the exact policy comparison.
           }),
         };
-        const amount = record.get("amount")!.toString();
+        const amountCodec = record.get("amount");
+        const deadlineCodec = record.get("deadline");
+        const createdBlockCodec = record.get("createdBlock");
+        if (amountCodec == null || deadlineCodec == null || createdBlockCodec == null)
+          throw new Error("flop: malformed escrow record");
+        const amount = amountCodec.toString();
+        // Same shape the rail requires of agreed terms: canonical positive u128.
+        if (
+          !/^[1-9][0-9]{0,38}$/.test(amount) ||
+          BigInt(amount) >= 2n ** 128n
+        )
+          throw new Error("flop: malformed escrow amount");
+        if (typeof raw.id !== "string" || !HEX32.test(raw.id))
+          throw new Error("flop: malformed escrow id");
+        if (typeof raw.status !== "string" || raw.status.length === 0)
+          throw new Error("flop: malformed escrow status");
         const escrow: FlopEscrow = {
-          id: String(raw.id),
+          id: raw.id,
           funder: account(raw.funder),
           payee: account(raw.payee),
           amount,
           policy,
-          deadline: integer(record.get("deadline")!.toString(), "deadline"),
+          deadline: integer(deadlineCodec.toString(), "deadline"),
           createdBlock: integer(
-            record.get("createdBlock")!.toString(),
+            createdBlockCodec.toString(),
             "created block",
           ),
           status: String(raw.status),
@@ -244,6 +295,9 @@ export class PolkadotFlopChain implements FlopChain {
         request.deadlineBlocks,
       ),
     );
+    // A malformed result may carry no txHash; keep the recovery path usable
+    // instead of throwing a raw TypeError while reading it.
+    const txHash = result.txHash?.toHex() ?? "unknown";
     const events = result.events.filter(
       ({ event }) =>
         event.section === "hasStation" && event.method === "EscrowOpened",
@@ -251,13 +305,17 @@ export class PolkadotFlopChain implements FlopChain {
     if (events.length !== 1)
       throw new FlopTransactionError(
         "flop: finalized open lacks exactly one EscrowOpened event",
-        result.txHash.toHex(),
+        txHash,
       );
-    const id = events[0].event.data[0].toString();
+    const data = events[0].event.data as unknown;
+    const id =
+      Array.isArray(data) && data.length > 0 && data[0] != null
+        ? data[0].toString()
+        : "";
     if (!HEX32.test(id))
       throw new FlopTransactionError(
         "flop: malformed EscrowOpened id",
-        result.txHash.toHex(),
+        txHash,
       );
     return id;
   }
@@ -287,18 +345,28 @@ export async function connectFlopRail(
   const api = new ApiPromise({ provider, noInitWarn: true });
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await Promise.race([
-      (async () => {
-        await provider.connect();
-        await api.isReadyOrError;
-      })(),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error("flop: connection timed out")),
-          20_000,
-        );
-      }),
-    ]);
+    try {
+      await Promise.race([
+        (async () => {
+          await provider.connect();
+          await api.isReadyOrError;
+        })(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("flop: connection timed out")),
+            20_000,
+          );
+        }),
+      ]);
+    } catch (error) {
+      // WsProvider rejects with a bare, empty-message ErrorEvent; surface a
+      // flop: error so the caller can tell a refused/blackhole endpoint from
+      // a timeout instead of matching on an empty string.
+      if (error instanceof Error && error.message.startsWith("flop:")) throw error;
+      throw new Error("flop: failed to connect to the FLOP node", {
+        cause: error,
+      });
+    }
     const genesis = api.genesisHash.toHex();
     if (config.expectedGenesisHash && genesis !== config.expectedGenesisHash)
       throw new Error("flop: genesis mismatch");

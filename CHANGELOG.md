@@ -8,6 +8,11 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- `PolkadotFlopChain` now fails closed with `flop:` errors instead of raw
+  `TypeError`s: `snapshot()` validates its own outputs and wraps transport
+  failures, `open()` keeps the `txHash` on malformed `EscrowOpened` event
+  data, and `connectFlopRail` reports connection failures as
+  `flop: failed to connect to the FLOP node` instead of a bare `ErrorEvent`.
 - Transcript JSON readers on runtimes without reviver source context now preserve
   escaped nonce keys and complete numeric tokens without accepting invalid JSON or
   changing signed text. Noncanonical nonce tokens remain rejected by verification.
